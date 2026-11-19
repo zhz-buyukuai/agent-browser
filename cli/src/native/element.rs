@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
+use super::click_point::{place_in_dispatch_viewport, ClickPoint};
 
 #[derive(Debug, Clone)]
 pub struct RefEntry {
@@ -144,6 +145,15 @@ impl RefMap {
 
     pub fn begin_snapshot(&mut self) {
         self.map.clear();
+    }
+
+    /// Starts a replacement map with the same durable identities and ref counter.
+    pub fn for_snapshot(&self) -> Self {
+        Self {
+            map: HashMap::new(),
+            documents: self.documents.clone(),
+            next_ref: self.next_ref,
+        }
     }
 
     /// Observe the document behind a page/frame pair. Unknown documents never
@@ -434,7 +444,7 @@ pub async fn resolve_element_center(
             if let Some(object_id) =
                 resolve_node_object_id(client, effective_session_id, backend_node_id).await
             {
-                if let Some((x, y)) = node_click_point(
+                if let Some(mut point) = node_click_point(
                     client,
                     effective_session_id,
                     &object_id,
@@ -443,7 +453,16 @@ pub async fn resolve_element_center(
                 )
                 .await?
                 {
-                    return Ok((x, y, effective_session_id.to_string()));
+                    place_in_dispatch_viewport(
+                        client,
+                        effective_session_id,
+                        entry.frame_id.as_deref(),
+                        backend_node_id,
+                        &mut point,
+                        selector_or_ref,
+                    )
+                    .await?;
+                    return Ok((point.x, point.y, effective_session_id.to_string()));
                 }
             }
             if !entry.allow_role_fallback {
@@ -466,7 +485,7 @@ pub async fn resolve_element_center(
         let object_id = resolve_node_object_id(client, effective_session_id, fresh_id)
             .await
             .ok_or_else(|| format!("Element not found: {}", selector_or_ref))?;
-        let (x, y) = node_click_point(
+        let mut point = node_click_point(
             client,
             effective_session_id,
             &object_id,
@@ -475,7 +494,16 @@ pub async fn resolve_element_center(
         )
         .await?
         .ok_or_else(|| format!("Element not found: {}", selector_or_ref))?;
-        return Ok((x, y, effective_session_id.to_string()));
+        place_in_dispatch_viewport(
+            client,
+            effective_session_id,
+            entry.frame_id.as_deref(),
+            fresh_id,
+            &mut point,
+            selector_or_ref,
+        )
+        .await?;
+        return Ok((point.x, point.y, effective_session_id.to_string()));
     }
 
     // CSS selector: honor an active `frame <sel>` selection.
@@ -603,17 +631,15 @@ async fn node_click_point(
     object_id: &str,
     target: &str,
     require_actionable: bool,
-) -> Result<Option<(f64, f64)>, String> {
+) -> Result<Option<ClickPoint>, String> {
     let function = format!(
         r#"async function() {{
             if (!this.isConnected) return {{ connected: false }};
             const doc = this.ownerDocument || document;
             const clickPoint = {CLICK_POINT_JS};
             const point = await clickPoint(this, doc);
-            const blockerAt = {BLOCKER_AT_JS};
             const notActionable = {ACTIONABILITY_JS};
-            const topDoc = (point.view && point.view.document) || doc;
-            return {{ connected: true, x: point.x, y: point.y, reason: notActionable(this, point.inView), blocker: blockerAt(doc, this, point.lx, point.ly) || blockerAt(topDoc, this, point.x, point.y) }};
+            return {{ connected: true, x: point.x, y: point.y, reason: notActionable(this, point.inView) }};
         }}"#,
     );
     let result = client
@@ -641,17 +667,11 @@ async fn node_click_point(
             return Err(not_actionable_error(target, reason));
         }
     }
-    if let Some(blocker) = value
-        .and_then(|v| v.get("blocker"))
-        .and_then(|v| v.as_str())
-    {
-        return Err(intercepted_error(target, blocker));
-    }
     match (
         value.and_then(|v| v.get("x")).and_then(|v| v.as_f64()),
         value.and_then(|v| v.get("y")).and_then(|v| v.as_f64()),
     ) {
-        (Some(x), Some(y)) => Ok(Some((x, y))),
+        (Some(x), Some(y)) => Ok(Some(ClickPoint { x, y })),
         _ => Err(format!("Element not found: {}", target)),
     }
 }
@@ -1162,7 +1182,7 @@ async fn resolve_by_selector(
     }
 }
 
-fn intercepted_error(target: &str, blocker: &str) -> String {
+pub(super) fn intercepted_error(target: &str, blocker: &str) -> String {
     format!(
         "Element '{}' is covered by <{}> at its click point, so the input would land on that element instead. Dismiss or interact with the covering element first (it is often a dialog, banner, or sticky header).",
         target, blocker
